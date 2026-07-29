@@ -33,6 +33,11 @@ MODIFY_WAIT_AFTER_SECONDS = 10
 CHECK_WAIT_AFTER_REF_RESOLVE_SECONDS = 10
 DELETE_SUBSCRIPTION_TIMEOUT_SECONDS = 10
 
+# Auto-confirmer API Gateway URL (created as part of test infrastructure)
+CONFIRMER_URL = "https://twxw40ssm1.execute-api.us-east-1.amazonaws.com/prod/confirm"
+# Time to wait for requeue + confirmation detection (1 min requeue + 70s buffer)
+PENDING_CONFIRMATION_WAIT_SECONDS = 90
+
 
 @pytest.fixture(scope="module")
 def subscription_sqs():
@@ -159,3 +164,91 @@ class TestSubscription:
 
         # Should still be synced — no unnecessary update triggered
         condition.assert_synced(sub_ref)
+
+
+@pytest.fixture(scope="module")
+def subscription_https(sns_client):
+    """Creates an HTTPS subscription to a topic using the auto-confirmer endpoint."""
+    subscription_name = random_suffix_name("subscription-https", 28)
+    boot_resources = get_bootstrap_resources()
+    topic = boot_resources.Topic1
+
+    replacements = REPLACEMENT_VALUES.copy()
+    replacements['SUBSCRIPTION_NAME'] = subscription_name
+    replacements['TOPIC_ARN'] = topic.arn
+    replacements['ENDPOINT'] = CONFIRMER_URL
+
+    resource_data = load_resource(
+        "subscription_https",
+        additional_replacements=replacements,
+    )
+
+    ref = k8s.CustomResourceReference(
+        CRD_GROUP, CRD_VERSION, SUBSCRIPTION_RESOURCE_PLURAL,
+        subscription_name, namespace="default",
+    )
+    k8s.create_custom_resource(ref, resource_data)
+    cr = k8s.wait_resource_consumed_by_controller(ref)
+
+    assert cr is not None
+    assert k8s.get_resource_exists(ref)
+
+    yield (ref, cr)
+
+    # Cleanup: get ARN from status if available
+    cr_latest = k8s.get_resource(ref)
+    sub_arn = None
+    if cr_latest and 'status' in cr_latest:
+        arn = cr_latest['status'].get('ackResourceMetadata', {}).get('arn')
+        if arn:
+            sub_arn = arn
+
+    _, deleted = k8s.delete_custom_resource(
+        ref,
+        period_length=DELETE_SUBSCRIPTION_TIMEOUT_SECONDS,
+    )
+    assert deleted
+
+    if sub_arn:
+        subscription.wait_until_deleted(sub_arn)
+
+
+@service_marker
+class TestSubscriptionPendingConfirmation:
+    def test_pending_confirmation_requeue(self, sns_client, subscription_https):
+        """TC: HTTPS subscription confirms via Lambda auto-confirmer, verifies
+        controller detects confirmation within ~90s (1 min requeue + buffer).
+
+        Flow:
+        1. HTTPS subscription is created pointing to the auto-confirmer Lambda.
+        2. SNS sends a SubscriptionConfirmation message; Lambda calls SubscribeURL.
+        3. Controller is expected to detect PendingConfirmation=true and requeue
+           after 1 minute (the fix under test).
+        4. After ~90s the controller should re-read the subscription and find
+           PendingConfirmation=false, then set Synced=True.
+        """
+        sub_ref, sub_cr = subscription_https
+
+        # Immediately after creation, the subscription may be pending confirmation
+        cr = k8s.get_resource(sub_ref)
+        assert cr is not None
+        assert 'status' in cr
+
+        # Give the auto-confirmer Lambda time to confirm (SNS typically delivers
+        # the SubscriptionConfirmation within a few seconds).
+        # Then wait for the controller requeue (1 min) + buffer to detect it.
+        time.sleep(PENDING_CONFIRMATION_WAIT_SECONDS)
+
+        # After requeue window, the subscription should be confirmed and Synced=True
+        condition.assert_synced(sub_ref)
+
+        # Verify via SNS API that PendingConfirmation is false
+        cr_latest = k8s.get_resource(sub_ref)
+        assert cr_latest is not None
+        assert 'status' in cr_latest
+        pending = cr_latest['status'].get('pendingConfirmation')
+        # pendingConfirmation should be "false" or absent after confirmation
+        assert pending != "true", (
+            f"Expected pendingConfirmation to be 'false' after confirmation, "
+            f"got: {pending}"
+        )

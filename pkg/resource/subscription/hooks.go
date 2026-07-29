@@ -16,13 +16,15 @@ package subscription
 import (
 	"context"
 	"errors"
-
 	ackcompare "github.com/aws-controllers-k8s/runtime/pkg/compare"
+	ackcondition "github.com/aws-controllers-k8s/runtime/pkg/condition"
 	ackerr "github.com/aws-controllers-k8s/runtime/pkg/errors"
+	ackrequeue "github.com/aws-controllers-k8s/runtime/pkg/requeue"
 	ackrtlog "github.com/aws-controllers-k8s/runtime/pkg/runtime/log"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	svcsdk "github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/smithy-go"
+	corev1 "k8s.io/api/core/v1"
 )
 
 var (
@@ -76,6 +78,16 @@ func (rm *resourceManager) customUpdate(
 
 	ko := desired.ko.DeepCopy()
 	rm.setStatusDefaults(ko)
+
+	// If subscription is pending confirmation, requeue after 1 minute
+	// to detect when the endpoint owner confirms the subscription.
+	if ko.Status.PendingConfirmation != nil && *ko.Status.PendingConfirmation == "true" {
+		msg := "Subscription is pending confirmation from the endpoint owner"
+		res := &resource{ko}
+		ackcondition.SetSynced(res, corev1.ConditionFalse, &msg, nil)
+		return res, ackrequeue.NeededAfter(nil, ackrequeue.DefaultRequeueAfterDuration)
+	}
+
 	return &resource{ko}, nil
 }
 
